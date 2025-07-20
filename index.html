@@ -1,0 +1,2270 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  signInAnonymously, // Utilisé pour l'accès transparent des clients
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword, // Gardé pour l'admin si besoin de créer un nouvel admin via l'interface
+  signOut
+} from 'firebase/auth';
+import {
+  getFirestore,
+  collection,
+  query,
+  onSnapshot,
+  addDoc,
+  doc,
+  updateDoc,
+  deleteDoc,
+  getDoc,
+  where,
+  getDocs,
+} from 'firebase/firestore';
+import { getStorage, ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+
+// --- Configuration Firebase (Personnalisée avec vos informations) ---
+// Ces variables sont injectées au moment de l'exécution par l'environnement Canvas.
+// POUR UN DÉPLOIEMENT RÉEL, UTILISEZ DES VARIABLES D'ENVIRONNEMENT (.env.local)
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// ✅ Votre configuration Firebase spécifique
+const firebaseConfig = {
+  apiKey: "AIzaSyCnJ1TntLmF5KMzW32G3Ye2WMUcpHRTdHM",
+  authDomain: "mamadou-66fe8.firebaseapp.com",
+  projectId: "mamadou-66fe8",
+  storageBucket: "mamadou-66fe8.appspot.com",
+  messagingSenderId: "435105859506",
+  appId: "1:435105859506:web:9a04e4125a25d3030ac6ab",
+  measurementId: "G-CN4645RGWC"
+};
+
+// ✅ L'email de l'administrateur que vous avez fourni
+const ADMIN_EMAIL = 'checksawadogo305@gmail.com';
+
+// ✅ Votre numéro WhatsApp professionnel
+const WHATSAPP_NUMBER = '+2250564574378'; // Format international avec code pays
+
+// Initialisation de Firebase
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+const storage = getStorage(app); // Initialisation de Firebase Storage
+
+// --- Composant Toast Notification ---
+const ToastNotification = React.memo(({ message, type, onClose }) => {
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onClose();
+    }, 5000); // Disparaît après 5 secondes
+    return () => clearTimeout(timer);
+  }, [onClose]);
+
+  const bgColor = type === 'success' ? 'bg-green-500' : 'bg-red-500';
+  const textColor = 'text-white';
+
+  return (
+    <div className={`fixed bottom-4 right-4 p-4 rounded-lg shadow-lg ${bgColor} ${textColor} z-50 animate-fade-in`} role="alert">
+      <div className="flex items-center justify-between">
+        <span>{message}</span>
+        <button onClick={onClose} className="ml-4 text-lg font-bold" aria-label="Fermer la notification">&times;</button>
+      </div>
+    </div>
+  );
+});
+
+// --- Composant Modal de Confirmation Personnalisée ---
+const ConfirmationModal = React.memo(({ message, onConfirm, onCancel }) => {
+  const modalRef = useRef(null);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        onCancel();
+      }
+    };
+    // Piège le focus à l'intérieur de la modale pour l'accessibilité
+    if (modalRef.current) {
+      modalRef.current.focus();
+    }
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onCancel]);
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" aria-labelledby="confirmation-title" tabIndex="-1" ref={modalRef}>
+      <div className="bg-white rounded-lg shadow-xl p-6 max-w-sm w-full relative text-center animate-slide-up">
+        <h3 id="confirmation-title" className="text-xl font-semibold text-gray-800 mb-4">Confirmation</h3>
+        <p className="text-gray-700 mb-6">{message}</p>
+        <div className="flex justify-center space-x-4">
+          <button
+            onClick={onConfirm}
+            className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+            aria-label="Confirmer l'action"
+          >
+            Confirmer
+          </button>
+          <button
+            onClick={onCancel}
+            className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+            aria-label="Annuler l'action"
+          >
+            Annuler
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+// --- Composant principal de l'application ---
+function App() {
+  // États pour gérer les données et l'interface utilisateur
+  const [products, setProducts] = useState([]);
+  const [orders, setOrders] = useState([]); // Vue de l'admin de toutes les commandes
+  const [userOrders, setUserOrders] = useState([]); // Vue de l'utilisateur de ses propres commandes
+  const [reviews, setReviews] = useState([]); // Vue de l'admin de tous les avis
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null); // Utilisateur actuellement connecté (peut être anonyme)
+  // REMOVED: showAuthModal, isLoginMode, authEmail, authPassword states
+  const [adminAuthModal, setAdminAuthModal] = useState(false); // Pour la modal de connexion admin
+  // L'email et le mot de passe de l'admin sont gérés localement dans AdminAuthModal maintenant
+  // const [adminEmail, setAdminEmail] = useState('');
+  // const [adminPassword, setAdminPassword] = useState('');
+
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState(null); // Pour les notifications toast
+  const [activeAdminTab, setActiveAdminTab] = useState('products');
+
+  // NOUVEAU : État pour le panier d'achat
+  const [cart, setCart] = useState(() => {
+    try {
+      const savedCart = localStorage.getItem('mamadou_electronique_cart');
+      return savedCart ? JSON.parse(savedCart) : [];
+    } catch (error) {
+      console.error("Erreur de récupération du panier depuis localStorage:", error);
+      return [];
+    }
+  });
+  const [showCartModal, setShowCartModal] = useState(false);
+
+  // États pour la modal de confirmation
+  const [showConfirmation, setShowConfirmation] = useState(false);
+  const [confirmationMessage, setConfirmationMessage] = useState('');
+  const [confirmationAction, setConfirmationAction] = useState(null);
+
+  // États pour la recherche et le filtrage côté client
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filterInStock, setFilterInStock] = useState(false);
+  const [filterPromotion, setFilterPromotion] = useState(false);
+  const [sortBy, setSortBy] = useState('name'); // 'name', 'priceAsc', 'priceDesc'
+
+  // Effet pour persister le panier dans localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('mamadou_electronique_cart', JSON.stringify(cart));
+    } catch (error) {
+      console.error("Erreur de sauvegarde du panier dans localStorage:", error);
+    }
+  }, [cart]);
+
+  // Fonction pour afficher une notification toast
+  const showToast = useCallback((message, type = 'success') => {
+    setToast({ message, type });
+  }, []);
+
+  // Fonction pour afficher la modal de confirmation
+  const confirmAction = useCallback((msg, action) => {
+    setConfirmationMessage(msg);
+    setConfirmationAction(() => action);
+    setShowConfirmation(true);
+  }, []);
+
+  // Fonctions de gestion du panier
+  const addToCart = useCallback((product) => {
+    setCart(prevCart => {
+      const existingItem = prevCart.find(item => item.id === product.id);
+      if (existingItem) {
+        showToast(`${product.name} (x${existingItem.quantity + 1}) dans le panier !`, 'success');
+        return prevCart.map(item =>
+          item.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
+        );
+      } else {
+        showToast(`${product.name} ajouté au panier !`, 'success');
+        return [...prevCart, { ...product, quantity: 1 }];
+      }
+    });
+  }, [showToast]);
+
+  const removeFromCart = useCallback((productId) => {
+    setCart(prevCart => prevCart.filter(item => item.id !== productId));
+    showToast('Article retiré du panier.', 'success');
+  }, [showToast]);
+
+  const updateCartQuantity = useCallback((productId, quantity) => {
+    setCart(prevCart => {
+      if (quantity <= 0) {
+        return prevCart.filter(item => item.id !== productId);
+      }
+      return prevCart.map(item =>
+        item.id === productId ? { ...item, quantity: quantity } : item
+      );
+    });
+  }, []);
+
+  const clearCart = useCallback(() => {
+    setCart([]);
+    showToast('Panier vidé.', 'success');
+  }, [showToast]);
+
+  // Fonction pour générer un ID de commande unique
+  const generateOrderId = () => {
+    const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+    const randomPart = Math.random().toString(36).substring(2, 8).toUpperCase(); // 6 random chars
+    return `CMD-${datePart}-${randomPart}`;
+  };
+
+  // Fonction pour passer la commande (simulé)
+  const placeOrder = useCallback(async (customerName, customerContact) => {
+    if (cart.length === 0) {
+      showToast('Votre panier est vide.', 'error');
+      return;
+    }
+    if (!currentUser) {
+      showToast('Erreur: Utilisateur non identifié. Veuillez rafraîchir la page.', 'error');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const orderId = generateOrderId();
+      const orderData = {
+        orderId: orderId,
+        userId: currentUser.uid, // Utilise l'UID de l'utilisateur anonyme ou authentifié
+        customerName,
+        customerContact,
+        items: cart.map(item => ({
+          productId: item.id,
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+          imageUrl: item.imageUrl,
+        })),
+        total: cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
+        orderDate: new Date().toISOString(),
+        status: 'En attente', // Statut de la commande
+      };
+
+      // Enregistrer la commande dans la collection de commandes de l'utilisateur
+      await addDoc(collection(db, `artifacts/${appId}/users/${currentUser.uid}/orders`), orderData);
+
+      // Enregistrer une copie de la commande dans la collection globale pour l'admin
+      await addDoc(collection(db, `artifacts/${appId}/public/data/all_orders`), orderData);
+
+
+      const orderDetails = cart.map(item =>
+        `* ${item.name} (x${item.quantity}) - ${item.price * item.quantity} FCFA`
+      ).join('\n');
+
+      const whatsappMessage = encodeURIComponent(
+        `Bonjour, je souhaite passer la commande suivante (ID: ${orderId}) :
+
+* Client: ${customerName}
+* Contact: ${customerContact}
+
+--- Détails de la commande ---
+${orderDetails}
+
+* Total de la commande: ${orderData.total} FCFA
+
+Merci de confirmer la disponibilité et les modalités de livraison.`
+      );
+      const whatsappLink = `https://wa.me/${WHATSAPP_NUMBER}?text=${whatsappMessage}`;
+      window.open(whatsappLink, '_blank');
+
+      clearCart();
+      showToast(`Commande ${orderId} passée avec succès !`, 'success');
+      setShowCartModal(false);
+    } catch (error) {
+      console.error('Erreur lors de la commande:', error);
+      showToast('Erreur lors de la commande. Veuillez réessayer.', 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [cart, currentUser, showToast, clearCart]);
+
+  // Fonction de connexion pour l'administrateur
+  const handleAdminLogin = useCallback(async (email, password) => { // Reçoit email et password en arguments
+    setToast(null);
+    setLoading(true);
+    try {
+      const userCredential = await signInWithEmailAndPassword(auth, email, password); // Utilise les arguments
+      if (userCredential.user.email === ADMIN_EMAIL) {
+        showToast('Connexion administrateur réussie !', 'success');
+        setAdminAuthModal(false);
+        // Pas besoin de réinitialiser adminEmail/Password ici, ils sont gérés localement dans la modal
+      } else {
+        await signOut(auth); // Déconnecte si ce n'est pas l'admin
+        showToast('Accès refusé: Cet email n\'est pas un compte administrateur.', 'error');
+      }
+    } catch (error) {
+      console.error('Erreur d\'authentification admin:', error.code, error.message);
+      let errorMessage = 'Erreur d\'authentification. Veuillez réessayer.';
+      if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password' || error.code === 'auth/invalid-credential') {
+        errorMessage = 'Email ou mot de passe incorrect.';
+      } else if (error.code === 'auth/invalid-email') {
+        errorMessage = 'Format d\'email invalide.';
+      }
+      showToast(errorMessage, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [showToast]); // showToast est la seule dépendance externe
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      // Après la déconnexion, réauthentifier anonymement pour les clients
+      await signInAnonymously(auth);
+      showToast('Déconnexion réussie.', 'success');
+    } catch (error) {
+      console.error('Erreur de déconnexion:', error);
+      showToast('Erreur lors de la déconnexion. Veuillez réessayer.', 'error');
+    }
+  };
+
+  // Fonction pour fermer la modale d'authentification admin
+  const handleCloseAdminAuthModal = useCallback(() => setAdminAuthModal(false), []);
+
+
+  // Effet pour l'authentification Firebase et l'écoute des données
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setCurrentUser(user);
+        setIsAdmin(user.email === ADMIN_EMAIL);
+        console.log('Utilisateur authentifié:', user.uid, 'Est admin:', user.email === ADMIN_EMAIL);
+
+        // Écoute des commandes de l'utilisateur actuel (même anonyme)
+        const userOrdersCollectionRef = collection(db, `artifacts/${appId}/users/${user.uid}/orders`);
+        const unsubscribeUserOrders = onSnapshot(userOrdersCollectionRef, (snapshot) => {
+          const ordersData = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+          }));
+          ordersData.sort((a, b) => new Date(b.orderDate) - new Date(a.orderDate));
+          setUserOrders(ordersData);
+          console.log('Commandes utilisateur mises à jour:', ordersData);
+        }, (error) => {
+          console.error('Erreur lors de la récupération des commandes utilisateur:', error);
+          showToast('Erreur lors du chargement de vos commandes. Veuillez réessayer.', 'error');
+        });
+
+        // Si l'utilisateur est admin, écouter toutes les commandes et tous les avis
+        if (user.email === ADMIN_EMAIL) {
+          const allOrdersCollectionRef = collection(db, `artifacts/${appId}/public/data/all_orders`);
+          const unsubscribeAllOrders = onSnapshot(allOrdersCollectionRef, (snapshot) => {
+            const ordersData = snapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data()
+            }));
+            ordersData.sort((a, b) => new Date(b.orderDate) - new Date(a.orderDate));
+            setOrders(ordersData);
+            console.log('Toutes les commandes mises à jour (Admin):', ordersData);
+          }, (error) => {
+            console.error('Erreur lors de la récupération de toutes les commandes:', error);
+            showToast('Erreur lors du chargement des commandes admin. Veuillez réessayer.', 'error');
+          });
+
+          const reviewsCollectionRef = collection(db, `artifacts/${appId}/public/data/reviews`);
+          const unsubscribeReviews = onSnapshot(reviewsCollectionRef, (snapshot) => {
+            const reviewsData = snapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data()
+            }));
+            setReviews(reviewsData);
+            console.log('Avis mis à jour (Admin):', reviewsData);
+          }, (error) => {
+            console.error('Erreur lors de la récupération des avis:', error);
+            showToast('Erreur lors du chargement des avis. Veuillez réessayer.', 'error');
+          });
+
+          return () => {
+            unsubscribeUserOrders();
+            unsubscribeAllOrders();
+            unsubscribeReviews();
+          };
+        } else {
+          // Si un utilisateur non-admin se connecte (ex: après déconnexion de l'admin),
+          // s'assurer qu'il est anonyme pour ne pas avoir de données d'admin.
+          // Si l'utilisateur est déjà anonyme, cela ne fait rien.
+          if (!user.isAnonymous) {
+             console.log('Déconnexion de l\'utilisateur non-admin et tentative de connexion anonyme.');
+             await signOut(auth);
+             await signInAnonymously(auth);
+          }
+          return () => {
+            unsubscribeUserOrders();
+          };
+        }
+      } else {
+        // Si aucun utilisateur n'est trouvé (y compris après déconnexion ou au premier chargement),
+        // se connecter anonymement pour permettre l'accès aux fonctionnalités client.
+        console.log('Aucun utilisateur trouvé. Tentative de connexion anonyme...');
+        try {
+          await signInAnonymously(auth);
+          console.log('Connecté anonymement pour l\'accès public.');
+        } catch (error) {
+          console.error('Erreur d\'authentification Firebase (anonyme):', error);
+          // ✅ Message d'erreur plus spécifique pour guider l'utilisateur
+          showToast('Erreur de connexion au service anonyme. Veuillez réessayer. Assurez-vous que l\'authentification anonyme est activée dans votre console Firebase.', 'error');
+        }
+        setCurrentUser(null);
+        setIsAdmin(false);
+        setUserOrders([]);
+        setOrders([]); // Effacer les commandes admin si non admin
+        setReviews([]); // Effacer les avis si non admin
+      }
+      setLoading(false);
+    });
+
+    const productsCollectionRef = collection(db, `artifacts/${appId}/public/data/products`);
+    const unsubscribeProducts = onSnapshot(productsCollectionRef, async (snapshot) => {
+      const productsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+
+      const productsWithRatings = await Promise.all(productsData.map(async (product) => {
+        const productReviewsQuery = query(collection(db, `artifacts/${appId}/public/data/reviews`), where('productId', '==', product.id), where('approved', '==', true));
+        const reviewSnapshot = await getDocs(productReviewsQuery);
+        const productReviews = reviewSnapshot.docs.map(doc => doc.data());
+
+        const totalRating = productReviews.reduce((sum, review) => sum + review.rating, 0);
+        const averageRating = productReviews.length > 0 ? (totalRating / productReviews.length) : 0;
+        const reviewCount = productReviews.length;
+
+        return { ...product, averageRating, reviewCount };
+      }));
+
+      setProducts(productsWithRatings);
+      console.log('Produits mis à jour avec ratings:', productsWithRatings);
+    }, (error) => {
+      console.error('Erreur lors de la récupération des produits:', error);
+      showToast('Erreur lors du chargement des produits. Veuillez réessayer.', 'error');
+    });
+
+    return () => {
+      unsubscribeAuth();
+      unsubscribeProducts();
+    };
+  }, [confirmAction, showToast]);
+
+  // Logique de filtrage et de tri des produits pour l'affichage client
+  const filteredAndSortedProducts = products
+    .filter(product => {
+      const matchesSearch = product.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                            product.descriptionCourte.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                            product.descriptionComplete.toLowerCase().includes(searchTerm.toLowerCase());
+      const matchesInStock = !filterInStock || product.inStock;
+      const matchesPromotion = !filterPromotion || product.isPromotion;
+      return matchesSearch && matchesInStock && matchesPromotion;
+    })
+    .sort((a, b) => {
+      if (sortBy === 'priceAsc') {
+        return a.price - b.price;
+      } else if (sortBy === 'priceDesc') {
+        return b.price - a.price;
+      } else { // Default to 'name'
+        return a.name.localeCompare(b.name);
+      }
+    });
+
+  // Composant de carte de produit pour l'affichage client
+  const ProductCard = React.memo(({ product, onClick, onAddToCart }) => (
+    <div
+      className="relative bg-white p-4 rounded-lg shadow-md hover:shadow-lg hover:scale-105 transition-all duration-300 flex flex-col items-center text-center border border-gray-200"
+      role="article"
+      aria-labelledby={`product-name-${product.id}`}
+    >
+      {product.isPromotion && (
+        <span className="absolute top-2 left-2 bg-yellow-400 text-yellow-900 text-xs font-bold px-2 py-1 rounded-full z-10 animate-pulse" aria-label="Produit en promotion">PROMO</span>
+      )}
+      <img
+        src={product.imageUrl && typeof product.imageUrl === 'string' && product.imageUrl.startsWith('http') ? product.imageUrl : `https://placehold.co/150x150/E0F2F7/000000?text=Image%20Non%20Dispo`}
+        alt={product.name}
+        className="w-32 h-32 object-contain rounded-md mb-4 transition-transform duration-300"
+        onError={(e) => {
+          console.error("Erreur de chargement d'image pour le produit:", product.name, "URL:", product.imageUrl, e);
+          e.target.onerror = null;
+          e.target.src = `https://placehold.co/150x150/E0F2F7/000000?text=Image%20Non%20Dispo`;
+        }}
+        loading="lazy"
+      />
+      <h3 id={`product-name-${product.id}`} className="text-lg font-semibold text-gray-800 mb-2">{product.name}</h3>
+      <p className="text-gray-600 text-sm mb-2 line-clamp-2">{product.descriptionCourte}</p>
+      <p className="text-xl font-bold text-blue-600">{product.price} FCFA</p>
+      {product.averageRating > 0 && (
+        <div className="flex items-center text-sm text-gray-700 mb-2" aria-label={`Note moyenne: ${product.averageRating} étoiles sur 5, basé sur ${product.reviewCount} avis`}>
+          {'⭐'.repeat(Math.round(product.averageRating))} ({product.reviewCount})
+        </div>
+      )}
+      {product.inStock ? (
+        <span className="text-green-600 text-sm font-medium mt-2" aria-label="En stock">En stock</span>
+      ) : (
+        <span className="text-red-600 text-sm font-medium mt-2" aria-label="Épuisé">Épuisé</span>
+      )}
+      <div className="mt-4 flex flex-col w-full space-y-2">
+        <button
+          onClick={() => onClick(product)}
+          className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+          aria-label={`Voir les détails de ${product.name}`}
+        >
+          Voir Détails
+        </button>
+        {product.inStock && (
+          <button
+            onClick={() => onAddToCart(product)}
+            className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+            aria-label={`Ajouter ${product.name} au panier`}
+          >
+            Ajouter au Panier
+          </button>
+        )}
+      </div>
+    </div>
+  ));
+
+  // Composant de détail de produit pour l'affichage client
+  const ProductDetail = React.memo(({ product, onClose, onAddToCart, currentUser, showToast }) => {
+    const modalRef = useRef(null);
+    const [reviewText, setReviewText] = useState('');
+    const [reviewRating, setReviewRating] = useState(0);
+    const [submittingReview, setSubmittingReview] = useState(false);
+    const [productReviews, setProductReviews] = useState([]);
+    const [reviewSummary, setReviewSummary] = useState(''); // Pour le résumé des avis
+    const [summarizingReviews, setSummarizingReviews] = useState(false); // État de chargement du résumé
+
+    // Fetch reviews for this product
+    useEffect(() => {
+      const q = query(collection(db, `artifacts/${appId}/public/data/reviews`), where('productId', '==', product.id), where('approved', '==', true));
+      const unsubscribeReviews = onSnapshot(q, (snapshot) => {
+        const reviewsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setProductReviews(reviewsData);
+      }, (error) => {
+        console.error("Erreur de récupération des avis pour le produit:", error);
+      });
+      return () => unsubscribeReviews();
+    }, [product.id, showToast]);
+
+    // Fonction pour résumer les avis avec Gemini
+    const summarizeReviewsWithGemini = async () => {
+      setSummarizingReviews(true);
+      setReviewSummary('');
+      try {
+        if (productReviews.length === 0) {
+          showToast('Aucun avis à résumer.', 'info');
+          setSummarizingReviews(false);
+          return;
+        }
+
+        const reviewsContent = productReviews.map(r => `"${r.text}" (Note: ${r.rating}/5)`).join('\n');
+        const prompt = `Veuillez résumer les avis suivants sur un produit. Mettez en évidence les points positifs et négatifs principaux. Voici les avis :\n\n${reviewsContent}`;
+
+        const apiKey = ""; // Géré par l'environnement Canvas
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+        const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+        const payload = { contents: chatHistory };
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (result.candidates && result.candidates.length > 0 &&
+            result.candidates[0].content && result.candidates[0].content.parts &&
+            result.candidates[0].content.parts.length > 0) {
+          const text = result.candidates[0].content.parts[0].text;
+          setReviewSummary(text);
+          showToast('Résumé généré avec succès !', 'success');
+        } else {
+          showToast('Erreur lors de la génération du résumé des avis.', 'error');
+          console.error('Réponse Gemini API inattendue pour le résumé:', result);
+        }
+      } catch (error) {
+        showToast(`Erreur lors de la génération du résumé: ${error.message}`, 'error');
+        console.error('Erreur lors de l\'appel à Gemini pour le résumé:', error);
+      } finally {
+        setSummarizingReviews(false);
+      }
+    };
+
+    // JSON-LD Schema Markup pour le SEO
+    const productSchema = {
+      "@context": "https://schema.org/",
+      "@type": "Product",
+      "name": product.name,
+      "image": product.imageUrl,
+      "description": product.descriptionComplete,
+      "sku": product.id,
+      "offers": {
+        "@type": "Offer",
+        "url": window.location.href,
+        "priceCurrency": "XOF",
+        "price": product.price,
+        "itemCondition": "https://schema.org/NewCondition",
+        "availability": product.inStock ? "https://schema.org/InStock" : "https://schema.org/OutOfStock"
+      },
+      "aggregateRating": product.averageRating > 0 ? {
+        "@type": "AggregateRating",
+        "ratingValue": product.averageRating.toFixed(1),
+        "reviewCount": product.reviewCount
+      } : undefined,
+      "review": productReviews.length > 0 ? productReviews.map(review => ({
+        "@type": "Review",
+        "reviewRating": {
+          "@type": "Rating",
+          "ratingValue": review.rating
+        },
+        "author": { "@type": "Person", "name": review.userName || "Anonyme" },
+        "reviewBody": review.text
+      })) : undefined
+    };
+
+    useEffect(() => {
+      const handleKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          onClose();
+        }
+      };
+      if (modalRef.current) {
+        modalRef.current.focus();
+      }
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [onClose]);
+
+    useEffect(() => {
+      const script = document.createElement('script');
+      script.type = 'application/ld+json';
+      script.innerHTML = JSON.stringify(productSchema);
+      document.head.appendChild(script);
+
+      return () => {
+        document.head.removeChild(script);
+      };
+    }, [productSchema]);
+
+    const handleReviewSubmit = async (e) => {
+      e.preventDefault();
+      if (!currentUser) {
+        showToast('Erreur: Impossible de soumettre l\'avis sans ID utilisateur.', 'error');
+        return;
+      }
+      if (reviewRating === 0 || reviewText.trim() === '') {
+        showToast('Veuillez donner une note et écrire un avis.', 'error');
+        return;
+      }
+
+      setSubmittingReview(true);
+      try {
+        await addDoc(collection(db, `artifacts/${appId}/public/data/reviews`), {
+          productId: product.id,
+          userId: currentUser.uid, // Utilise l'UID de l'utilisateur anonyme
+          userName: currentUser.isAnonymous ? 'Client Anonyme' : (currentUser.email || 'Utilisateur'), // Nom pour l'avis
+          rating: reviewRating,
+          text: reviewText.trim(),
+          createdAt: new Date().toISOString(),
+          approved: false,
+        });
+        showToast('Votre avis a été soumis et est en attente d\'approbation.', 'success');
+        setReviewText('');
+        setReviewRating(0);
+      } catch (error) {
+        console.error('Erreur lors de la soumission de l\'avis:', error);
+        showToast('Erreur lors de la soumission de l\'avis. Veuillez réessayer.', 'error');
+      } finally {
+        setSubmittingReview(false);
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" aria-labelledby="product-detail-title" tabIndex="-1" ref={modalRef}>
+        <div className="bg-white rounded-lg shadow-xl p-6 max-w-2xl w-full relative overflow-y-auto max-h-[90vh] animate-slide-up">
+          <button
+            className="absolute top-3 right-3 text-gray-500 hover:text-gray-800 text-2xl transition-colors duration-200"
+            onClick={onClose}
+            aria-label="Fermer les détails du produit"
+          >
+            &times;
+          </button>
+          <div className="flex flex-col md:flex-row gap-6">
+            <img
+              src={product.imageUrl && typeof product.imageUrl === 'string' && product.imageUrl.startsWith('http') ? product.imageUrl : `https://placehold.co/300x300/E0F2F7/000000?text=Image%20Non%20Dispo`}
+              alt={product.name}
+              className="w-full md:w-1/2 h-auto object-contain rounded-md"
+              onError={(e) => {
+                console.error("Erreur de chargement d'image pour le produit:", product.name, "URL:", product.imageUrl, e);
+                e.target.onerror = null;
+                e.target.src = `https://placehold.co/300x300/E0F2F7/000000?text=Image%20Non%20Dispo`;
+              }}
+              loading="lazy"
+            />
+            <div className="md:w-1/2">
+              <h2 id="product-detail-title" className="text-3xl font-bold text-gray-900 mb-3">{product.name}</h2>
+              <p className="text-gray-700 mb-4">{product.descriptionComplete}</p>
+              <p className="text-2xl font-bold text-blue-700 mb-4">{product.price} FCFA</p>
+              {product.averageRating > 0 && (
+                <div className="flex items-center text-lg text-gray-800 mb-4" aria-label={`Note moyenne: ${product.averageRating} étoiles sur 5, basé sur ${product.reviewCount} avis`}>
+                  {'⭐'.repeat(Math.round(product.averageRating))} ({product.reviewCount} avis)
+                </div>
+              )}
+              {product.inStock ? (
+                <span className="bg-green-100 text-green-800 text-sm font-medium px-3 py-1 rounded-full" aria-label="Statut: En stock">En stock</span>
+              ) : (
+                <span className="bg-red-100 text-red-800 text-sm font-medium px-3 py-1 rounded-full" aria-label="Statut: Épuisé">Épuisé</span>
+              )}
+              {product.isPromotion && (
+                <span className="ml-2 bg-yellow-100 text-yellow-800 text-sm font-medium px-3 py-1 rounded-full" aria-label="Produit en promotion">Promotion !</span>
+              )}
+              {product.inStock && (
+                <button
+                  onClick={() => { onAddToCart(product); onClose(); }}
+                  className="mt-6 w-full inline-flex items-center justify-center px-6 py-3 border border-transparent text-base font-medium rounded-md shadow-sm text-white bg-green-500 hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-colors duration-200 transform hover:scale-105"
+                  aria-label={`Ajouter ${product.name} au panier`}
+                >
+                  <svg className="w-5 h-5 mr-2" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3 10v11c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V10H3zm18-5h-4.83l-1.42-1.42C14.21 2.95 13.72 2 12 2s-2.21.95-3.75 2.58L6.83 5H2.99C2.45 5 2 5.45 2 6l-.01 1c0 .55.44 1 .99 1H21c.55 0 1-.45 1-1V6c0-.55-.45-1-1-1z"/>
+                  </svg>
+                  Ajouter au Panier
+                </button>
+              )}
+
+              {/* Section Avis Clients */}
+              <div className="mt-8 pt-4 border-t border-gray-200">
+                <h3 className="text-xl font-bold text-gray-800 mb-3">Avis des clients ({productReviews.length})</h3>
+                {productReviews.length === 0 ? (
+                  <p className="text-gray-600 text-sm italic">Soyez le premier à laisser un avis !</p>
+                ) : (
+                  <>
+                    <ul className="space-y-3 max-h-48 overflow-y-auto pr-2">
+                      {productReviews.map((review) => (
+                        <li key={review.id} className="bg-gray-50 p-3 rounded-md text-gray-700 text-sm">
+                          <div className="flex items-center mb-1">
+                            <span className="font-semibold mr-2">{review.userName || 'Utilisateur'}</span>
+                            <span className="text-yellow-500">{'⭐'.repeat(review.rating)}</span>
+                          </div>
+                          <p className="italic">"{review.text}"</p>
+                        </li>
+                      ))}
+                    </ul>
+                    {productReviews.length > 0 && (
+                      <button
+                        onClick={summarizeReviewsWithGemini}
+                        disabled={summarizingReviews}
+                        className="mt-4 w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-md shadow-sm transition-colors duration-200 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {summarizingReviews ? 'Résumé en cours...' : 'Résumer les Avis ✨'}
+                      </button>
+                    )}
+                    {reviewSummary && (
+                      <div className="mt-4 p-4 bg-purple-50 rounded-lg border border-purple-200">
+                        <h4 className="text-lg font-semibold text-purple-800 mb-2">Résumé des Avis :</h4>
+                        <p className="text-gray-700 whitespace-pre-wrap">{reviewSummary}</p>
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* Formulaire de soumission d'avis */}
+                <form onSubmit={handleReviewSubmit} className="mt-6 p-4 bg-blue-50 rounded-lg">
+                  <h4 className="text-lg font-semibold text-gray-800 mb-3">Laisser un avis</h4>
+                  <div className="mb-3">
+                    <label htmlFor="reviewRating" className="block text-gray-700 text-sm font-bold mb-2">Votre note:</label>
+                    <div className="flex items-center">
+                      {[1, 2, 3, 4, 5].map((star) => (
+                        <span
+                          key={star}
+                          className={`cursor-pointer text-3xl ${star <= reviewRating ? 'text-yellow-500' : 'text-gray-300'}`}
+                          onClick={() => setReviewRating(star)}
+                          aria-label={`${star} étoile${star > 1 ? 's' : ''}`}
+                          role="radio"
+                          aria-checked={star === reviewRating}
+                          tabIndex="0"
+                        >
+                          ★
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="mb-3">
+                    <label htmlFor="reviewText" className="block text-gray-700 text-sm font-bold mb-2">Votre commentaire:</label>
+                    <textarea
+                      id="reviewText"
+                      value={reviewText}
+                      onChange={(e) => setReviewText(e.target.value)}
+                      className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline h-24"
+                      placeholder="Écrivez votre avis ici..."
+                      required
+                    ></textarea>
+                  </div>
+                  <button
+                    type="submit"
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+                    disabled={submittingReview}
+                  >
+                    {submittingReview ? 'Envoi...' : 'Soumettre l\'avis'}
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // Composant d'ajout/modification de produit pour l'admin
+  const ProductForm = React.memo(({ productToEdit, onSave, onCancel, showToast }) => {
+    const [name, setName] = useState(productToEdit?.name || '');
+    const [descriptionCourte, setDescriptionCourte] = useState(productToEdit?.descriptionCourte || '');
+    const [descriptionComplete, setDescriptionComplete] = useState(productToEdit?.descriptionComplete || '');
+    const [price, setPrice] = useState(productToEdit?.price || '');
+    const [imageUrl, setImageUrl] = useState(productToEdit?.imageUrl || '');
+    const [imageFile, setImageFile] = useState(null);
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [isUploading, setIsUploading] = useState(false);
+    const [inStock, setInStock] = useState(productToEdit?.inStock ?? true);
+    const [isPromotion, setIsPromotion] = useState(productToEdit?.isPromotion ?? false);
+    const [reviewsAdminText, setReviewsAdminText] = useState(productToEdit?.reviews?.join('\n') || '');
+    const [formError, setFormError] = useState('');
+    const [generatingDescription, setGeneratingDescription] = useState(false); // État de chargement de la génération
+
+    const formRef = useRef(null);
+
+    useEffect(() => {
+      const handleKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          onCancel();
+        }
+      };
+      if (formRef.current) {
+        formRef.current.focus();
+      }
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [onCancel]);
+
+    const handleFileChange = (e) => {
+      if (e.target.files[0]) {
+        setImageFile(e.target.files[0]);
+        setFormError('');
+      }
+    };
+
+    const uploadImage = async (file) => {
+      if (!file) return imageUrl;
+
+      setIsUploading(true);
+      setUploadProgress(0);
+      const storageRef = ref(storage, `product_images/${Date.now()}_${file.name}`);
+      const uploadTask = uploadBytesResumable(storageRef, file);
+
+      return new Promise((resolve, reject) => {
+        uploadTask.on('state_changed',
+          (snapshot) => {
+            const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+            setUploadProgress(progress);
+          },
+          (error) => {
+            console.error("Erreur de téléchargement d'image:", error);
+            showToast("Erreur lors du téléchargement de l'image.", 'error');
+            setIsUploading(false);
+            reject(error);
+          },
+          async () => {
+            const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
+            setIsUploading(false);
+            resolve(downloadURL);
+          }
+        );
+      });
+    };
+
+    // Fonction pour générer la description complète avec Gemini
+    const generateFullDescriptionWithGemini = async () => {
+      setGeneratingDescription(true);
+      try {
+        if (!descriptionCourte.trim()) {
+          showToast('Veuillez saisir une description courte pour générer la description complète.', 'info');
+          setGeneratingDescription(false);
+          return;
+        }
+
+        const prompt = `Développez cette courte description de produit en une description complète et attrayante pour le commerce électronique, en mettant en évidence les principales caractéristiques, les avantages et un appel à l'action. Le produit est : "${descriptionCourte}"`;
+
+        const apiKey = ""; // Géré par l'environnement Canvas
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+        const chatHistory = [{ role: "user", parts: [{ text: prompt }] }];
+        const payload = { contents: chatHistory };
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (result.candidates && result.candidates.length > 0 &&
+            result.candidates[0].content && result.candidates[0].content.parts &&
+            result.candidates[0].content.parts.length > 0) {
+          const text = result.candidates[0].content.parts[0].text;
+          setDescriptionComplete(text);
+          showToast('Description générée avec succès !', 'success');
+        } else {
+          showToast('Erreur lors de la génération de la description complète.', 'error');
+          console.error('Réponse Gemini API inattendue pour la description:', result);
+        }
+      } catch (error) {
+        showToast(`Erreur lors de la génération de la description: ${error.message}`, 'error');
+        console.error('Erreur lors de l\'appel à Gemini pour la description:', error);
+      } finally {
+        setGeneratingDescription(false);
+      }
+    };
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      setFormError('');
+
+      if (!name || !descriptionCourte || !descriptionComplete || !price) {
+        setFormError('Tous les champs obligatoires doivent être remplis.');
+        return;
+      }
+      if (isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
+        setFormError('Le prix doit être un nombre positif.');
+        return;
+      }
+
+      let finalImageUrl = imageUrl;
+      if (imageFile) {
+        try {
+          finalImageUrl = await uploadImage(imageFile);
+        } catch (uploadError) {
+          setFormError("Échec du téléchargement de l'image. Veuillez réessayer.");
+          return;
+        }
+      } else if (imageUrl && (!typeof imageUrl === 'string' || !imageUrl.startsWith('http'))) {
+        setFormError("L'URL de l'image doit être vide ou commencer par 'http'.");
+        return;
+      }
+
+
+      const productData = {
+        name,
+        descriptionCourte,
+        descriptionComplete,
+        price: parseFloat(price),
+        imageUrl: finalImageUrl,
+        inStock,
+        isPromotion,
+        reviews: reviewsAdminText.split('\n').map(r => r.trim()).filter(r => r !== ''),
+        createdAt: productToEdit ? productToEdit.createdAt : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      try {
+        if (productToEdit) {
+          const productRef = doc(db, `artifacts/${appId}/public/data/products`, productToEdit.id);
+          await updateDoc(productRef, productData);
+          showToast('Produit mis à jour avec succès !', 'success');
+        } else {
+          await addDoc(collection(db, `artifacts/${appId}/public/data/products`), productData);
+          showToast('Produit ajouté avec succès !', 'success');
+        }
+        onSave();
+      } catch (error) {
+        console.error('Erreur lors de la sauvegarde du produit:', error);
+        showToast('Erreur lors de la sauvegarde du produit. Veuillez réessayer.', 'error');
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" tabIndex="-1" ref={formRef}>
+        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-lg shadow-xl max-w-lg w-full relative overflow-y-auto max-h-[90vh] animate-slide-up">
+          <h2 id="product-form-title" className="text-2xl font-bold mb-4 text-gray-800">{productToEdit ? 'Modifier le produit' : 'Ajouter un nouveau produit'}</h2>
+          {formError && (
+            <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+              {formError}
+            </div>
+          )}
+          <div className="mb-4">
+            <label htmlFor="name" className="block text-gray-700 text-sm font-bold mb-2">Nom du produit:<span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              id="name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="descriptionCourte" className="block text-gray-700 text-sm font-bold mb-2">Description courte:<span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              id="descriptionCourte"
+              value={descriptionCourte}
+              onChange={(e) => setDescriptionCourte(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="descriptionComplete" className="block text-gray-700 text-sm font-bold mb-2">Description complète:<span className="text-red-500">*</span></label>
+            <textarea
+              id="descriptionComplete"
+              value={descriptionComplete}
+              onChange={(e) => setDescriptionComplete(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline h-24"
+              required
+              aria-required="true"
+            ></textarea>
+            <button
+              type="button"
+              onClick={generateFullDescriptionWithGemini}
+              disabled={generatingDescription || !descriptionCourte.trim()}
+              className="mt-2 w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded-md shadow-sm transition-colors duration-200 transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {generatingDescription ? 'Génération en cours...' : 'Générer Description Complète ✨'}
+            </button>
+          </div>
+          <div className="mb-4">
+            <label htmlFor="price" className="block text-gray-700 text-sm font-bold mb-2">Prix (FCFA):<span className="text-red-500">*</span></label>
+            <input
+              type="number"
+              id="price"
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              step="0.01"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="imageUrl" className="block text-gray-700 text-sm font-bold mb-2">URL de l'image existante (ou téléchargez-en une nouvelle):</label>
+            <input
+              type="url"
+              id="imageUrl"
+              value={imageUrl}
+              onChange={(e) => setImageUrl(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              placeholder="Ex: https://example.com/image.jpg"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="imageUpload" className="block text-gray-700 text-sm font-bold mb-2">Télécharger une nouvelle image:</label>
+            <input
+              type="file"
+              id="imageUpload"
+              accept="image/*"
+              onChange={handleFileChange}
+              className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+            />
+            {isUploading && (
+              <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
+                <div className="bg-blue-600 h-2.5 rounded-full" style={{ width: `${uploadProgress}%` }}></div>
+                <span className="text-xs text-gray-600 ml-2">{Math.round(uploadProgress)}%</span>
+              </div>
+            )}
+            {imageFile && !isUploading && (
+              <p className="text-sm text-green-600 mt-1">Fichier sélectionné : {imageFile.name}</p>
+            )}
+          </div>
+          <div className="mb-4 flex items-center">
+            <input
+              type="checkbox"
+              id="inStock"
+              checked={inStock}
+              onChange={(e) => setInStock(e.target.checked)}
+              className="mr-2 leading-tight"
+              aria-checked={inStock}
+            />
+            <label htmlFor="inStock" className="text-sm text-gray-700">En stock</label>
+          </div>
+          <div className="mb-6 flex items-center">
+            <input
+              type="checkbox"
+              id="isPromotion"
+              checked={isPromotion}
+              onChange={(e) => setIsPromotion(e.target.checked)}
+              className="mr-2 leading-tight"
+              aria-checked={isPromotion}
+            />
+            <label htmlFor="isPromotion" className="text-sm text-gray-700">Mettre en promotion</label>
+          </div>
+          <div className="mb-6">
+            <label htmlFor="reviewsAdminText" className="block text-gray-700 text-sm font-bold mb-2">Anciens Avis (un par ligne - pour compatibilité):</label>
+            <textarea
+              id="reviewsAdminText"
+              value={reviewsAdminText}
+              onChange={(e) => setReviewsAdminText(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline h-24"
+              placeholder="Ex:&#10;Excellent produit !&#10;Très satisfait de mon achat."
+            ></textarea>
+          </div>
+          <div className="flex items-center justify-between">
+            <button
+              type="submit"
+              className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:shadow-outline transition-colors duration-200 transform hover:scale-105"
+              disabled={isUploading || generatingDescription}
+            >
+              {isUploading || generatingDescription ? (
+                <span className="flex items-center">
+                  <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Chargement...
+                </span>
+              ) : (productToEdit ? 'Mettre à jour' : 'Ajouter')}
+            </button>
+            <button
+              type="button"
+              onClick={onCancel}
+              className="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:shadow-outline transition-colors duration-200 transform hover:scale-105"
+            >
+              Annuler
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  });
+
+  // Composant d'ajout/modification de commande pour l'admin
+  const OrderForm = React.memo(({ orderToEdit, onSave, onCancel }) => {
+    const [productName, setProductName] = useState(orderToEdit?.productName || '');
+    const [customerName, setCustomerName] = useState(orderToEdit?.customerName || '');
+    const [customerContact, setCustomerContact] = useState(orderToEdit?.customerContact || '');
+    const [orderDate, setOrderDate] = useState(orderToEdit?.orderDate ? new Date(orderToEdit.orderDate).toISOString().split('T')[0] : new Date().toISOString().split('T')[0]);
+    const [status, setStatus] = useState(orderToEdit?.status || 'En attente');
+    const [formError, setFormError] = useState('');
+    const formRef = useRef(null);
+
+    useEffect(() => {
+      const handleKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          onCancel();
+        }
+      };
+      if (formRef.current) {
+        formRef.current.focus();
+      }
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [onCancel]);
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      setFormError('');
+
+      if (!productName || !customerName || !customerContact || !orderDate || !status) {
+        setFormError('Tous les champs obligatoires doivent être remplis.');
+        return;
+      }
+      if (!/^\+\d{8,15}$/.test(customerContact)) {
+        setFormError('Le contact WhatsApp doit être un numéro de téléphone valide avec le code pays (ex: +2250712345678).');
+        return;
+      }
+
+      if (!currentUser || !isAdmin) {
+        showToast('Accès refusé. Vous n\'êtes pas autorisé à modifier les commandes.', 'error');
+        return;
+      }
+      const orderData = {
+        productName,
+        customerName,
+        customerContact,
+        orderDate: new Date(orderDate).toISOString(),
+        status,
+        createdAt: orderToEdit ? orderToEdit.createdAt : new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        userId: orderToEdit?.userId || 'admin_manual_entry',
+      };
+
+      try {
+        if (orderToEdit) {
+          const orderRef = doc(db, `artifacts/${appId}/public/data/all_orders`, orderToEdit.id);
+          await updateDoc(orderRef, orderData);
+
+          if (orderToEdit.userId && orderToEdit.id) {
+            const userOrderRef = doc(db, `artifacts/${appId}/users/${orderToEdit.userId}/orders`, orderToEdit.id);
+            const userOrderDoc = await getDoc(userOrderRef);
+            if (userOrderDoc.exists()) {
+              await updateDoc(userOrderRef, orderData);
+            } else {
+              console.warn(`Document de commande utilisateur non trouvé pour ID ${orderToEdit.id} sous userId ${orderToEdit.userId}.`);
+            }
+          }
+          showToast('Commande mise à jour avec succès !', 'success');
+        } else {
+          const docRef = await addDoc(collection(db, `artifacts/${appId}/public/data/all_orders`), orderData);
+          showToast('Commande ajoutée avec succès !', 'success');
+        }
+        onSave();
+      } catch (error) {
+        console.error('Erreur lors de la sauvegarde de la commande:', error);
+        showToast('Erreur lors de la sauvegarde de la commande. Veuillez réessayer.', 'error');
+      }
+    };
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" tabIndex="-1" ref={formRef}>
+        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-lg shadow-xl max-w-lg w-full relative overflow-y-auto max-h-[90vh] animate-slide-up">
+          <h2 id="order-form-title" className="text-2xl font-bold mb-4 text-gray-800">{orderToEdit ? 'Modifier la commande' : 'Ajouter une nouvelle commande'}</h2>
+          {formError && (
+            <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+              {formError}
+            </div>
+          )}
+          <div className="mb-4">
+            <label htmlFor="orderProductName" className="block text-gray-700 text-sm font-bold mb-2">Nom du produit:<span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              id="orderProductName"
+              value={productName}
+              onChange={(e) => setProductName(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="customerName" className="block text-gray-700 text-sm font-bold mb-2">Nom du client:<span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              id="customerName"
+              value={customerName}
+              onChange={(e) => setCustomerName(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-4">
+            <label htmlFor="customerContact" className="block text-gray-700 text-sm font-bold mb-2">Contact du client (WhatsApp):<span className="text-red-500">*</span></label>
+            <input
+              type="text"
+              id="customerContact"
+              value={customerContact}
+              onChange={(e) => setCustomerContact(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              placeholder="+2250712345678"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-6">
+            <label htmlFor="orderDate" className="block text-gray-700 text-sm font-bold mb-2">Date de la commande:<span className="text-red-500">*</span></label>
+            <input
+              type="date"
+              id="orderDate"
+              value={orderDate}
+              onChange={(e) => setOrderDate(e.target.value)}
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-6">
+            <label htmlFor="orderStatus" className="block text-gray-700 text-sm font-bold mb-2">Statut de la commande:<span className="text-red-500">*</span></label>
+            <select
+              id="orderStatus"
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+              className="shadow border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            >
+              <option value="En attente">En attente</option>
+              <option value="Traitée">Traitée</option>
+              <option value="Terminée">Terminée</option>
+              <option value="Annulée">Annulée</option>
+            </select>
+          </div>
+          <div className="flex items-center justify-between">
+            <button
+              type="submit"
+              className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:shadow-outline transition-colors duration-200 transform hover:scale-105"
+            >
+              {orderToEdit ? 'Mettre à jour' : 'Ajouter'}
+            </button>
+            <button
+              type="button"
+              onClick={onCancel}
+              className="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded-md focus:outline-none focus:shadow-outline transition-colors duration-200 transform hover:scale-105"
+            >
+              Annuler
+            </button>
+          </div>
+        </form>
+      </div>
+    );
+  });
+
+  // Composant de la modal de connexion administrateur
+  const AdminAuthModal = React.memo(({ onAuth, onClose, loading }) => {
+    // Gère l'état de l'email et du mot de passe localement dans la modal
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const modalRef = useRef(null);
+
+    useEffect(() => {
+      const handleKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          onClose();
+        }
+      };
+      if (modalRef.current) {
+        modalRef.current.focus();
+      }
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [onClose]);
+
+    const handleSubmit = () => {
+      onAuth(email, password); // Passe les valeurs locales à la fonction d'authentification du parent
+    };
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" tabIndex="-1" ref={modalRef}>
+        <div className="bg-white p-8 rounded-lg shadow-xl max-w-sm w-full relative animate-slide-up">
+          <button
+            className="absolute top-3 right-3 text-gray-500 hover:text-gray-800 text-2xl transition-colors duration-200"
+            onClick={onClose}
+            aria-label="Fermer la fenêtre de connexion administrateur"
+          >
+            &times;
+          </button>
+          <h2 id="admin-auth-modal-title" className="text-2xl font-bold mb-6 text-center text-gray-800">Connexion Administrateur</h2>
+          <div className="mb-4">
+            <label htmlFor="adminEmail" className="block text-gray-700 text-sm font-bold mb-2">Email:</label>
+            <input
+              type="email"
+              id="adminEmail"
+              value={email} // Lié à l'état local de la modal
+              onChange={(e) => setEmail(e.target.value)} // Met à jour l'état local
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <div className="mb-6">
+            <label htmlFor="adminPassword" className="block text-gray-700 text-sm font-bold mb-2">Mot de passe:</label>
+            <input
+              type="password"
+              id="adminPassword"
+              value={password} // Lié à l'état local de la modal
+              onChange={(e) => setPassword(e.target.value)} // Met à jour l'état local
+              className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 mb-3 leading-tight focus:outline-none focus:shadow-outline"
+              required
+              aria-required="true"
+            />
+          </div>
+          <button
+            onClick={handleSubmit} // Appelle la fonction locale qui passe les données au parent
+            className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-md w-full focus:outline-none focus:shadow-outline transition-colors duration-200 transform hover:scale-105"
+            disabled={loading}
+          >
+            {loading ? (
+              <span className="flex items-center justify-center">
+                <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Chargement...
+              </span>
+            ) : 'Se connecter (Admin)'}
+          </button>
+        </div>
+      </div>
+    );
+  });
+
+  // Composant pour l'historique des commandes de l'utilisateur
+  const UserOrdersHistory = React.memo(({ orders }) => {
+    return (
+      <div className="p-6 bg-gray-100 min-h-screen">
+        <div className="max-w-7xl mx-auto">
+          <h1 className="text-4xl font-extrabold text-gray-900 mb-8 text-center">Mon Historique de Commandes</h1>
+          <div className="bg-white rounded-lg shadow-md p-6 mt-6">
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID Commande</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Produits</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Statut</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {orders.length === 0 ? (
+                    <tr>
+                      <td colSpan="5" className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
+                        Vous n'avez pas encore passé de commande.
+                      </td>
+                    </tr>
+                  ) : (
+                    orders.map((order) => (
+                      <tr key={order.id}>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                          {order.orderId || order.id}
+                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-500">
+                          <ul className="list-disc list-inside">
+                            {order.items && order.items.map((item, idx) => (
+                              <li key={idx}>{item.name} (x{item.quantity})</li>
+                            ))}
+                          </ul>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {order.total} FCFA
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm">
+                          <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                            ${order.status === 'En attente' ? 'bg-yellow-100 text-yellow-800' :
+                              order.status === 'Traitée' ? 'bg-blue-100 text-blue-800' :
+                              order.status === 'Terminée' ? 'bg-green-100 text-green-800' :
+                              'bg-red-100 text-red-800'}`}>
+                            {order.status}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                          {new Date(order.orderDate).toLocaleDateString('fr-FR')}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  });
+
+  // Composant AdminPanel (ajouté comme placeholder)
+  const AdminPanel = React.memo(({ onLogout, currentUser, orders, reviews, showToast, products }) => {
+    const [selectedProductForEdit, setSelectedProductForEdit] = useState(null);
+    const [showProductForm, setShowProductForm] = useState(false);
+
+    const handleAddProductClick = () => {
+      setSelectedProductForEdit(null);
+      setShowProductForm(true);
+    };
+
+    const handleEditProductClick = (product) => {
+      setSelectedProductForEdit(product);
+      setShowProductForm(true);
+    };
+
+    const handleDeleteProduct = useCallback(async (productId) => {
+      try {
+        await deleteDoc(doc(db, `artifacts/${appId}/public/data/products`, productId));
+        showToast('Produit supprimé avec succès !', 'success');
+      } catch (error) {
+        console.error('Erreur lors de la suppression du produit:', error);
+        showToast('Erreur lors de la suppression du produit. Veuillez réessayer.', 'error');
+      }
+    }, [showToast]);
+
+    const handleApproveReview = useCallback(async (reviewId, currentApprovedStatus) => {
+      try {
+        const reviewRef = doc(db, `artifacts/${appId}/public/data/reviews`, reviewId);
+        await updateDoc(reviewRef, { approved: !currentApprovedStatus });
+        showToast(`Avis ${!currentApprovedStatus ? 'approuvé' : 'désapprouvé'} avec succès !`, 'success');
+      } catch (error) {
+        console.error('Erreur lors de la mise à jour de l\'avis:', error);
+        showToast('Erreur lors de la mise à jour de l\'avis. Veuillez réessayer.', 'error');
+      }
+    }, [showToast]);
+
+    const handleDeleteReview = useCallback(async (reviewId) => {
+      try {
+        await deleteDoc(doc(db, `artifacts/${appId}/public/data/reviews`, reviewId));
+        showToast('Avis supprimé avec succès !', 'success');
+      } catch (error) {
+        console.error('Erreur lors de la suppression de l\'avis:', error);
+        showToast('Erreur lors de la suppression de l\'avis. Veuillez réessayer.', 'error');
+      }
+    }, [showToast]);
+
+    // État pour la pagination des produits
+    const [productsPerPage] = useState(10);
+    const [currentPage, setCurrentPage] = useState(1);
+    const indexOfLastProduct = currentPage * productsPerPage;
+    const indexOfFirstProduct = indexOfLastProduct - productsPerPage;
+    const currentProducts = products.slice(indexOfFirstProduct, indexOfLastProduct);
+    const totalPages = Math.ceil(products.length / productsPerPage);
+
+    const paginate = (pageNumber) => setCurrentPage(pageNumber);
+
+    return (
+      <div className="p-6 bg-gray-100 min-h-screen">
+        <div className="max-w-7xl mx-auto">
+          <h1 className="text-4xl font-extrabold text-gray-900 mb-8 text-center">Panneau d'Administration</h1>
+          <p className="text-lg text-gray-700 text-center mb-6">
+            Bienvenue, Admin {currentUser?.email}. Votre ID: <span className="font-mono text-gray-700">{currentUser?.uid}</span>
+          </p>
+
+          <div className="flex justify-center mb-6 space-x-4">
+            <button
+              onClick={() => setActiveAdminTab('products')}
+              className={`py-2 px-4 rounded-md font-semibold transition-colors ${activeAdminTab === 'products' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+            >
+              Gestion des Produits
+            </button>
+            <button
+              onClick={() => setActiveAdminTab('orders')}
+              className={`py-2 px-4 rounded-md font-semibold transition-colors ${activeAdminTab === 'orders' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+            >
+              Gestion des Commandes
+            </button>
+            <button
+              onClick={() => setActiveAdminTab('reviews')}
+              className={`py-2 px-4 rounded-md font-semibold transition-colors ${activeAdminTab === 'reviews' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+            >
+              Gestion des Avis
+            </button>
+          </div>
+
+          {activeAdminTab === 'products' && (
+            <section className="bg-white rounded-lg shadow-md p-6 mt-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-2xl font-bold text-gray-800">Gestion des Produits ({products.length})</h2>
+                <button
+                  onClick={handleAddProductClick}
+                  className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-md transition-colors duration-200 transform hover:scale-105"
+                >
+                  Ajouter un Produit
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Image</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nom</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Prix</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Stock</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Promo</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {currentProducts.length === 0 ? (
+                      <tr>
+                        <td colSpan="6" className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
+                          Aucun produit à afficher.
+                        </td>
+                      </tr>
+                    ) : (
+                      currentProducts.map((product) => (
+                        <tr key={product.id}>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <img src={product.imageUrl || `https://placehold.co/50x50/E0F2F7/000000?text=Img`} alt={product.name} className="h-10 w-10 object-contain rounded-md" />
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{product.name}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{product.price} FCFA</td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${product.inStock ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                              {product.inStock ? 'Oui' : 'Non'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${product.isPromotion ? 'bg-yellow-100 text-yellow-800' : 'bg-gray-100 text-gray-800'}`}>
+                              {product.isPromotion ? 'Oui' : 'Non'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <button
+                              onClick={() => handleEditProductClick(product)}
+                              className="text-indigo-600 hover:text-indigo-900 mr-3"
+                              aria-label={`Modifier ${product.name}`}
+                            >
+                              Modifier
+                            </button>
+                            <button
+                              onClick={() => confirmAction(`Êtes-vous sûr de vouloir supprimer ${product.name} ?`, () => handleDeleteProduct(product.id))}
+                              className="text-red-600 hover:text-red-900"
+                              aria-label={`Supprimer ${product.name}`}
+                            >
+                              Supprimer
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              {/* Pagination Controls */}
+              <div className="mt-4 flex justify-center space-x-2">
+                {Array.from({ length: totalPages }, (_, i) => (
+                  <button
+                    key={i + 1}
+                    onClick={() => paginate(i + 1)}
+                    className={`px-3 py-1 rounded-md ${currentPage === i + 1 ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-800 hover:bg-gray-300'}`}
+                  >
+                    {i + 1}
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {activeAdminTab === 'orders' && (
+            <section className="bg-white rounded-lg shadow-md p-6 mt-6">
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">Gestion des Commandes ({orders.length})</h2>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID Commande</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Client</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contact</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Produits</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Statut</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {orders.length === 0 ? (
+                      <tr>
+                        <td colSpan="8" className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
+                          Aucune commande à afficher.
+                        </td>
+                      </tr>
+                    ) : (
+                      orders.map((order) => (
+                        <tr key={order.id}>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{order.orderId || order.id}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{order.customerName}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{order.customerContact}</td>
+                          <td className="px-6 py-4 text-sm text-gray-500">
+                            <ul className="list-disc list-inside">
+                              {order.items && order.items.map((item, idx) => (
+                                <li key={idx}>{item.name} (x{item.quantity})</li>
+                              ))}
+                            </ul>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{order.total} FCFA</td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                              ${order.status === 'En attente' ? 'bg-yellow-100 text-yellow-800' :
+                                order.status === 'Traitée' ? 'bg-blue-100 text-blue-800' :
+                                order.status === 'Terminée' ? 'bg-green-100 text-green-800' :
+                                'bg-red-100 text-red-800'}`}>
+                              {order.status}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{new Date(order.orderDate).toLocaleDateString('fr-FR')}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            {/* Ajoutez ici les boutons pour modifier/supprimer la commande si nécessaire */}
+                            <button
+                              onClick={() => showToast("Fonctionnalité de modification de commande à implémenter", "info")}
+                              className="text-indigo-600 hover:text-indigo-900 mr-3"
+                            >
+                              Modifier
+                            </button>
+                            <button
+                              onClick={() => confirmAction(`Êtes-vous sûr de vouloir supprimer la commande ${order.orderId || order.id} ?`, () => showToast("Fonctionnalité de suppression de commande à implémenter", "info"))}
+                              className="text-red-600 hover:text-red-900"
+                            >
+                              Supprimer
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          {activeAdminTab === 'reviews' && (
+            <section className="bg-white rounded-lg shadow-md p-6 mt-6">
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">Gestion des Avis ({reviews.length})</h2>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Produit ID</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Utilisateur</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Note</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avis</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Approuvé</th>
+                      <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white divide-y divide-gray-200">
+                    {reviews.length === 0 ? (
+                      <tr>
+                        <td colSpan="6" className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
+                          Aucun avis à afficher.
+                        </td>
+                      </tr>
+                    ) : (
+                      reviews.map((review) => (
+                        <tr key={review.id}>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{review.productId}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{review.userName}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{review.rating} ⭐</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 max-w-xs truncate">{review.text}</td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${review.approved ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                              {review.approved ? 'Oui' : 'Non'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <button
+                              onClick={() => handleApproveReview(review.id, review.approved)}
+                              className={`mr-3 ${review.approved ? 'text-yellow-600 hover:text-yellow-900' : 'text-green-600 hover:text-green-900'}`}
+                              aria-label={review.approved ? 'Désapprouver cet avis' : 'Approuver cet avis'}
+                            >
+                              {review.approved ? 'Désapprouver' : 'Approuver'}
+                            </button>
+                            <button
+                              onClick={() => confirmAction(`Êtes-vous sûr de vouloir supprimer cet avis de ${review.userName} ?`, () => handleDeleteReview(review.id))}
+                              className="text-red-600 hover:text-red-900"
+                              aria-label="Supprimer cet avis"
+                            >
+                              Supprimer
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          <button
+            onClick={onLogout}
+            className="mt-8 bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-md transition-colors"
+          >
+            Déconnexion Admin
+          </button>
+        </div>
+
+        {showProductForm && (
+          <ProductForm
+            productToEdit={selectedProductForEdit}
+            onSave={() => { setShowProductForm(false); setSelectedProductForEdit(null); }}
+            onCancel={() => { setShowProductForm(false); setSelectedProductForEdit(null); }}
+            showToast={showToast}
+          />
+        )}
+      </div>
+    );
+  });
+
+
+  // Affichage d'un message de chargement pendant l'initialisation de l'application
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100">
+        <div className="text-xl font-semibold text-gray-700">
+          <svg className="animate-spin h-8 w-8 text-blue-600 mr-3 inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+          </svg>
+          Chargement de l'application...
+        </div>
+      </div>
+    );
+  }
+
+  // Rendu de l'application principale
+  return (
+    <div className="font-inter antialiased bg-gray-50 text-gray-900">
+      {/* Styles CSS pour les animations */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        @keyframes slideUp {
+          from { transform: translateY(20px); opacity: 0; }
+          to { transform: translateY(0); opacity: 1; }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.3s ease-out forwards;
+        }
+        .animate-slide-up {
+          animation: slideUp 0.3s ease-out forwards;
+        }
+        .animate-pulse {
+          animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: .5; }
+        }
+      `}</style>
+      
+      {/* En-tête de l'application */}
+      <header className="bg-blue-700 text-white p-4 shadow-md" role="banner">
+        <div className="container mx-auto flex justify-between items-center">
+          <h1 className="text-3xl font-extrabold">MAMADOU ÉLECTRONIQUE</h1>
+          <nav role="navigation" aria-label="Navigation principale">
+            <button
+              onClick={() => { setSelectedProduct(null); setAdminAuthModal(false); setShowCartModal(false); setIsAdmin(false); }}
+              className="mr-4 hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+              aria-label="Aller à la page d'accueil"
+            >
+              Accueil
+            </button>
+            {currentUser && !isAdmin && (
+              <button
+                onClick={() => { setSelectedProduct(null); setAdminAuthModal(false); setShowCartModal(false); setActiveAdminTab('userOrders'); }}
+                className="mr-4 hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+                aria-label="Voir mon historique de commandes"
+              >
+                Mes Commandes
+              </button>
+            )}
+            <button
+              onClick={() => setShowCartModal(true)}
+              className="relative mr-4 hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+              aria-label={`Voir le panier. ${cart.length} articles dans le panier.`}
+            >
+              Panier ({cart.length})
+              {cart.length > 0 && (
+                <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center animate-pulse" aria-hidden="true">
+                  {cart.length}
+                </span>
+              )}
+            </button>
+            {isAdmin ? (
+              <button
+                onClick={handleLogout}
+                className="hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+                aria-label="Déconnexion"
+              >
+                Déconnexion (Admin)
+              </button>
+            ) : (
+              <button
+                onClick={() => { setAdminAuthModal(true); /* Pas besoin de réinitialiser ici */ }}
+                className="hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+                aria-label="Connexion administrateur"
+              >
+                Connexion Admin
+              </button>
+            )}
+            {isAdmin && (
+              <button
+                onClick={() => { setSelectedProduct(null); setAdminAuthModal(false); setShowCartModal(false); setActiveAdminTab('products'); }}
+                className="ml-4 hover:text-blue-200 transition-colors duration-200 transform hover:scale-105"
+                aria-label="Accéder au panneau administrateur"
+              >
+                Admin Panel
+              </button>
+            )}
+          </nav>
+        </div>
+      </header>
+
+      {/* Affichage des messages d'information/erreur */}
+      {toast && (
+        <ToastNotification
+          message={toast.message}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
+
+      {/* Modal de connexion administrateur */}
+      {adminAuthModal && (
+        <AdminAuthModal
+          onAuth={handleAdminLogin} // Passe la fonction de connexion du parent
+          onClose={handleCloseAdminAuthModal} // Utilisation de la fonction useCallback définie en dehors du JSX
+          loading={loading}
+        />
+      )}
+
+      {/* Affichage du panneau administrateur si connecté, sinon l'interface client */}
+      {isAdmin ? (
+        <AdminPanel onLogout={handleLogout} currentUser={currentUser} orders={orders} reviews={reviews} showToast={showToast} products={products} />
+      ) : (
+        activeAdminTab === 'userOrders' ? (
+          <UserOrdersHistory orders={userOrders} />
+        ) : (
+          <main className="container mx-auto p-6" role="main">
+            <section className="text-center my-8">
+              <h2 className="text-4xl font-extrabold text-gray-900 mb-4">Découvrez nos produits électroniques !</h2>
+              <p className="text-lg text-gray-600">
+                Frigos, téléviseurs, machines à laver et bien plus encore, au meilleur prix.
+              </p>
+              {currentUser && (
+                <p className="text-sm text-gray-500 mt-2">
+                  Bienvenue ! Votre ID de session (pour le support technique): <span className="font-mono text-gray-700">{currentUser.uid}</span>
+                </p>
+              )}
+            </section>
+
+            {/* Barre de recherche et filtres */}
+            <section className="my-8 p-4 bg-white rounded-lg shadow-md flex flex-col md:flex-row items-center justify-between space-y-4 md:space-y-0 md:space-x-4">
+              <div className="w-full md:w-1/2">
+                <label htmlFor="search-products" className="sr-only">Rechercher des produits</label>
+                <input
+                  type="text"
+                  id="search-products"
+                  placeholder="Rechercher un produit..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                  aria-label="Champ de recherche de produits"
+                />
+              </div>
+              <div className="flex flex-wrap items-center space-x-4 w-full md:w-auto justify-center">
+                <div className="flex items-center">
+                  <input
+                    type="checkbox"
+                    id="filterInStock"
+                    checked={filterInStock}
+                    onChange={(e) => setFilterInStock(e.target.checked)}
+                    className="mr-2 leading-tight"
+                    aria-checked={filterInStock}
+                  />
+                  <label htmlFor="filterInStock" className="text-sm text-gray-700">En stock</label>
+                </div>
+                <div className="flex items-center">
+                  <input
+                    type="checkbox"
+                    id="filterPromotion"
+                    checked={filterPromotion}
+                    onChange={(e) => setFilterPromotion(e.target.checked)}
+                    className="mr-2 leading-tight"
+                    aria-checked={filterPromotion}
+                  />
+                  <label htmlFor="filterPromotion" className="text-sm text-gray-700">Promotions</label>
+                </div>
+                <div>
+                  <label htmlFor="sortBy" className="sr-only">Trier par</label>
+                  <select
+                    id="sortBy"
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value)}
+                    className="shadow border rounded py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                    aria-label="Options de tri des produits"
+                  >
+                    <option value="name">Trier par Nom</option>
+                    <option value="priceAsc">Prix Croissant</option>
+                    <option value="priceDesc">Prix Décroissant</option>
+                  </select>
+                </div>
+              </div>
+            </section>
+
+            {/* Section des produits en promotion (filtrés par le terme de recherche) */}
+            {filteredAndSortedProducts.filter(p => p.isPromotion).length > 0 && (
+              <section className="my-12">
+                <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Nos Promotions !</h2>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
+                  {filteredAndSortedProducts.filter(p => p.isPromotion).map((product) => (
+                    <ProductCard key={product.id} product={product} onClick={setSelectedProduct} onAddToCart={addToCart} />
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Section de tous les articles (filtrés et triés) */}
+            <section className="my-12">
+              <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Tous nos Articles</h2>
+              {filteredAndSortedProducts.length === 0 ? (
+                <p className="text-center text-gray-600 text-lg">
+                  Aucun produit trouvé avec vos critères.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
+                  {filteredAndSortedProducts.map((product) => (
+                    <ProductCard key={product.id} product={product} onClick={setSelectedProduct} onAddToCart={addToCart} />
+                  ))}
+                </div>
+              )}
+            </section>
+
+            {/* Affichage des détails du produit sélectionné */}
+            {selectedProduct && (
+              <ProductDetail product={selectedProduct} onClose={() => setSelectedProduct(null)} onAddToCart={addToCart} currentUser={currentUser} showToast={showToast} />
+            )}
+          </main>
+        )
+      )}
+
+      {/* Pied de page de l'application */}
+      <footer className="bg-gray-800 text-white p-6 mt-12 text-center" role="contentinfo">
+        <div className="container mx-auto">
+          <p>&copy; {new Date().getFullYear()} MAMADOU ÉLECTRONIQUE. Tous droits réservés.</p>
+          <p className="text-sm mt-2">Contactez-nous sur WhatsApp pour toute commande ou question !</p>
+        </div>
+      </footer>
+
+      {/* Modal de confirmation globale */}
+      {showConfirmation && (
+        <ConfirmationModal
+          message={confirmationMessage}
+          onConfirm={() => {
+            if (confirmationAction) confirmationAction();
+            setShowConfirmation(false);
+          }}
+          onCancel={() => setShowConfirmation(false)}
+        />
+      )}
+
+      {/* Modal du Panier */}
+      {showCartModal && (
+        <CartModal
+          cartItems={cart}
+          onUpdateQuantity={updateCartQuantity}
+          onRemoveItem={removeFromCart}
+          onClearCart={clearCart}
+          onPlaceOrder={placeOrder}
+          onClose={() => setShowCartModal(false)}
+          currentUser={currentUser}
+          showToast={showToast}
+          loading={loading}
+        />
+      )}
+    </div>
+  );
+}
+
+// Composant pour la modal du panier (inclut le checkout simulé)
+const CartModal = React.memo(({ cartItems, onUpdateQuantity, onRemoveItem, onClearCart, onPlaceOrder, onClose, currentUser, showToast, loading }) => {
+  const modalRef = useRef(null);
+  const total = cartItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const [customerName, setCustomerName] = useState(''); // Nom client vide par défaut
+  const [customerContact, setCustomerContact] = useState('');
+  const [checkoutError, setCheckoutError] = useState('');
+  const [showCheckoutForm, setShowCheckoutForm] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+    if (modalRef.current) {
+      modalRef.current.focus();
+    }
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  const handleProceedToCheckout = () => {
+    if (cartItems.length === 0) {
+      showToast('Votre panier est vide.', 'error');
+      return;
+    }
+    if (!currentUser) {
+      showToast('Erreur: Impossible de procéder sans ID utilisateur. Veuillez rafraîchir la page.', 'error');
+      return;
+    }
+    setShowCheckoutForm(true);
+  };
+
+  const handleFinalPlaceOrder = async (e) => {
+    e.preventDefault();
+    setCheckoutError('');
+
+    if (!customerName.trim() || !customerContact.trim()) {
+      setCheckoutError('Veuillez remplir votre nom et votre contact.');
+      return;
+    }
+    if (!/^\+\d{8,15}$/.test(customerContact)) {
+      setCheckoutError('Le contact WhatsApp doit être un numéro de téléphone valide avec le code pays (ex: +2250712345678).');
+      return;
+    }
+
+    await onPlaceOrder(customerName, customerContact);
+    setShowCheckoutForm(false);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center p-4 z-50 animate-fade-in" role="dialog" aria-modal="true" tabIndex="-1" ref={modalRef}>
+      <div className="bg-white rounded-lg shadow-xl p-6 max-w-lg w-full relative overflow-y-auto max-h-[90vh] animate-slide-up">
+        <button
+          className="absolute top-3 right-3 text-gray-500 hover:text-gray-800 text-2xl transition-colors duration-200"
+          onClick={onClose}
+          aria-label="Fermer le panier"
+        >
+          &times;
+        </button>
+        <h2 id="cart-modal-title" className="text-2xl font-bold text-gray-800 mb-4">Votre Panier</h2>
+
+        {cartItems.length === 0 ? (
+          <p className="text-gray-600 text-center py-8">Votre panier est vide.</p>
+        ) : (
+          <>
+            <ul className="space-y-4 mb-6">
+              {cartItems.map(item => (
+                <li key={item.id} className="flex items-center justify-between bg-gray-50 p-3 rounded-md shadow-sm">
+                  <div className="flex items-center flex-grow">
+                    <img
+                      src={item.imageUrl && typeof item.imageUrl === 'string' && item.imageUrl.startsWith('http') ? item.imageUrl : `https://placehold.co/50x50/E0F2F7/000000?text=Img`}
+                      alt={item.name}
+                      className="w-12 h-12 object-contain rounded-md mr-4"
+                      onError={(e) => { e.target.onerror = null; e.target.src = `https://placehold.co/50x50/E0F2F7/000000?text=Img`; }}
+                    />
+                    <div className="flex-grow">
+                      <p className="font-semibold text-gray-800">{item.name}</p>
+                      <p className="text-sm text-gray-600">{item.price} FCFA / unité</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={() => onUpdateQuantity(item.id, item.quantity - 1)}
+                      className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-1 px-2 rounded-md transition-colors duration-200"
+                      aria-label={`Diminuer la quantité de ${item.name}`}
+                    >
+                      -
+                    </button>
+                    <span className="font-bold text-lg">{item.quantity}</span>
+                    <button
+                      onClick={() => onUpdateQuantity(item.id, item.quantity + 1)}
+                      className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-1 px-2 rounded-md transition-colors duration-200"
+                      aria-label={`Augmenter la quantité de ${item.name}`}
+                    >
+                      +
+                    </button>
+                    <button
+                      onClick={() => onRemoveItem(item.id)}
+                      className="text-red-600 hover:text-red-800 ml-2"
+                      aria-label={`Supprimer ${item.name} du panier`}
+                    >
+                      <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+                      </svg>
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="flex justify-between items-center border-t pt-4 mt-4">
+              <p className="text-xl font-bold text-gray-900">Total:</p>
+              <p className="text-2xl font-bold text-blue-700">{total} FCFA</p>
+            </div>
+            {!showCheckoutForm && (
+              <div className="mt-6 flex flex-col sm:flex-row space-y-3 sm:space-y-0 sm:space-x-4">
+                <button
+                  onClick={handleProceedToCheckout}
+                  className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-md shadow-md transition-colors duration-200 transform hover:scale-105"
+                  aria-label="Passer à la commande"
+                  disabled={loading}
+                >
+                  {loading ? 'Chargement...' : 'Passer à la commande'}
+                </button>
+                <button
+                  onClick={onClearCart}
+                  className="w-full bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-6 rounded-md shadow-md transition-colors duration-200 transform hover:scale-105"
+                  aria-label="Vider le panier"
+                >
+                  Vider le Panier
+                </button>
+              </div>
+            )}
+
+            {showCheckoutForm && (
+              <form onSubmit={handleFinalPlaceOrder} className="mt-6 p-4 bg-blue-50 rounded-lg">
+                <h3 className="text-xl font-bold text-gray-800 mb-4">Vos informations de commande</h3>
+                {checkoutError && (
+                  <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+                    {checkoutError}
+                  </div>
+                )}
+                <div className="mb-4">
+                  <label htmlFor="customerName" className="block text-gray-700 text-sm font-bold mb-2">Votre Nom:</label>
+                  <input
+                    type="text"
+                    id="customerName"
+                    value={customerName}
+                    onChange={(e) => setCustomerName(e.target.value)}
+                    className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                    required
+                  />
+                </div>
+                <div className="mb-4">
+                  <label htmlFor="customerContact" className="block text-gray-700 text-sm font-bold mb-2">Votre Contact WhatsApp (avec code pays, ex: +225...):</label>
+                  <input
+                    type="tel"
+                    id="customerContact"
+                    value={customerContact}
+                    onChange={(e) => setCustomerContact(e.target.value)}
+                    className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                    placeholder="+2250712345678"
+                    required
+                  />
+                </div>
+                <div className="flex justify-between space-x-4">
+                  <button
+                    type="submit"
+                    className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-6 rounded-md shadow-md transition-colors duration-200 transform hover:scale-105"
+                    disabled={loading}
+                  >
+                    {loading ? 'Envoi de la commande...' : 'Confirmer et Commander via WhatsApp'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowCheckoutForm(false)}
+                    className="w-full bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-6 rounded-md shadow-md transition-colors duration-200 transform hover:scale-105"
+                  >
+                    Retour au panier
+                  </button>
+                </div>
+              </form>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+});
+
+export default App;
